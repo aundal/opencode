@@ -7,6 +7,7 @@ import {
   For,
   Match,
   on,
+  onCleanup,
   onMount,
   Show,
   Switch,
@@ -82,7 +83,15 @@ import * as Model from "../../util/model"
 import { formatTranscript } from "../../util/transcript"
 import { UI } from "@/cli/ui.ts"
 import { useTuiConfig } from "../../context/tui-config"
-import { nextThinkingMode, reasoningSummary, useThinkingMode, type ThinkingMode } from "../../context/thinking"
+import {
+  nextCommandMode,
+  nextThinkingMode,
+  reasoningSummary,
+  useCommandMode,
+  useThinkingMode,
+  type ThinkingMode,
+} from "../../context/thinking"
+import { DialogPrompt } from "../../ui/dialog-prompt"
 import { getScrollAcceleration } from "../../util/scroll"
 import { collapseToolOutput } from "../../util/collapse-tool-output"
 import { TuiPluginRuntime } from "@/cli/cmd/tui/plugin/runtime"
@@ -165,6 +174,7 @@ const context = createContext<{
   conceal: () => boolean
   thinkingMode: () => ThinkingMode
   showThinking: () => boolean
+  showCommands: () => boolean
   showTimestamps: () => boolean
   showDetails: () => boolean
   showGenericToolOutput: () => boolean
@@ -223,7 +233,9 @@ export function Session() {
   const [conceal, setConceal] = createSignal(true)
   const thinking = useThinkingMode()
   const thinkingMode = thinking.mode
-  const showThinking = createMemo(() => true)
+  const commandMode = useCommandMode()
+  const showThinking = createMemo(() => thinkingMode() !== "hidden")
+  const showCommands = createMemo(() => commandMode.mode() !== "hidden")
   const [timestamps, setTimestamps] = kv.signal<"hide" | "show">("timestamps", "hide")
   const [showDetails, setShowDetails] = kv.signal("tool_details_visibility", true)
   const [showAssistantMetadata, _setShowAssistantMetadata] = kv.signal("assistant_metadata_visibility", true)
@@ -691,24 +703,50 @@ export function Session() {
       },
     },
     {
-      title: (() => {
-        const next = nextThinkingMode(thinkingMode())
-        if (next === "hide") return "Collapse thinking"
-        return "Expand thinking"
-      })(),
+      title: "Set terminal title",
+      value: "session.title",
+      category: "Session",
+      run: async () => {
+        const current = typeof kv.get("terminal_title_override") === "string" ? String(kv.get("terminal_title_override")) : ""
+        const value = await DialogPrompt.show(dialog, "Terminal title", {
+          value: current,
+          placeholder: "Enter title",
+        })
+        if (value === null) return
+        const next = value.trim()
+        kv.set("terminal_title_override", next || undefined)
+        dialog.clear()
+      },
+    },
+    {
+      title: thinkingMode() === "hidden" ? "Show thinking" : "Hide thinking",
       value: "session.toggle.thinking",
       category: "Session",
-      slash: {
-        name: "thinking",
-        aliases: ["toggle-thinking"],
-      },
       run: () => {
         thinking.set(nextThinkingMode(thinkingMode()))
         dialog.clear()
       },
     },
     {
-      title: showDetails() ? "Hide tool details" : "Show tool details",
+      title: commandMode.mode() === "hidden" ? "Show shell commands" : "Hide shell commands",
+      value: "session.toggle.commands",
+      category: "Session",
+      run: () => {
+        commandMode.set(nextCommandMode(commandMode.mode()))
+        dialog.clear()
+      },
+    },
+    {
+      title: "Open commands",
+      value: "session.commands",
+      category: "Session",
+      run: () => {
+        keymap.dispatchCommand("command.palette.show")
+        dialog.clear()
+      },
+    },
+    {
+      title: showDetails() ? "Hide tool rows" : "Show tool rows",
       value: "session.toggle.actions",
       category: "Session",
       run: () => {
@@ -1123,6 +1161,7 @@ export function Session() {
           conceal,
           thinkingMode,
           showThinking,
+          showCommands,
           showTimestamps,
           showDetails,
           showGenericToolOutput,
@@ -1434,17 +1473,26 @@ function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; las
   const sync = useSync()
   const messages = createMemo(() => sync.data.message[props.message.sessionID] ?? [])
   const model = createMemo(() => Model.name(ctx.providers(), props.message.providerID, props.message.modelID))
+  const [now, setNow] = createSignal(Date.now())
+
+  createEffect(() => {
+    if (props.message.time.completed) return
+    const timer = setInterval(() => setNow(Date.now()), 1000)
+    onCleanup(() => clearInterval(timer))
+  })
 
   const final = createMemo(() => {
     return props.message.finish && !["tool-calls", "unknown"].includes(props.message.finish)
   })
 
   const duration = createMemo(() => {
-    if (!final()) return 0
-    if (!props.message.time.completed) return 0
     const user = messages().find((x) => x.role === "user" && x.id === props.message.parentID)
     if (!user || !user.time) return 0
-    return props.message.time.completed - user.time.created
+    const end = props.message.time.completed ?? now()
+    return Math.max(0, end - user.time.created)
+  })
+  const requestCount = createMemo(() => {
+    return messages().filter((item) => item.role === "assistant" && item.parentID === props.message.parentID).length
   })
 
   const childShortcut = useCommandShortcut("session.child.first")
@@ -1466,7 +1514,7 @@ function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; las
           )
         }}
       </For>
-      <Show when={props.parts.some((x) => x.type === "tool" && x.tool === "task")}>
+      <Show when={ctx.showDetails() && props.parts.some((x) => x.type === "tool" && x.tool === "task")}>
         <box paddingTop={1} paddingLeft={3}>
           <text fg={theme.text}>
             {childShortcut()}
@@ -1504,8 +1552,14 @@ function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; las
               </span>{" "}
               <span style={{ fg: theme.text }}>{Locale.titlecase(props.message.mode)}</span>
               <span style={{ fg: theme.textMuted }}> · {model()}</span>
+              <Show when={requestCount() > 0}>
+                <span style={{ fg: theme.textMuted }}> · {requestCount()} req.</span>
+              </Show>
               <Show when={duration()}>
                 <span style={{ fg: theme.textMuted }}> · {Locale.duration(duration())}</span>
+              </Show>
+              <Show when={props.message.time.completed}>
+                {(completed) => <span style={{ fg: theme.textMuted }}> · {Locale.timestamp(completed())}</span>}
               </Show>
               <Show when={props.message.error?.name === "MessageAbortedError"}>
                 <span style={{ fg: theme.textMuted }}> · interrupted</span>
@@ -1538,7 +1592,6 @@ function ReasoningPart(props: { last: boolean; part: ReasoningPart; message: Ass
   // Reasoning is finalized when the server sets `time.end` (see processor.ts).
   // Flips independently of the parent message completing.
   const isDone = createMemo(() => props.part.time.end !== undefined)
-  const inMinimal = createMemo(() => ctx.thinkingMode() === "hide")
   const duration = createMemo(() => {
     const end = props.part.time.end
     return end === undefined ? 0 : Math.max(0, end - props.part.time.start)
@@ -1547,24 +1600,23 @@ function ReasoningPart(props: { last: boolean; part: ReasoningPart; message: Ass
   const syntax = createMemo(() => generateSubtleSyntax(theme))
 
   const toggle = () => {
-    if (!inMinimal()) return
     setExpanded((prev) => !prev)
   }
 
   return (
-    <Show when={content()}>
+    <Show when={ctx.showThinking() && content()}>
       <box id={"text-" + props.part.id} paddingLeft={3} marginTop={1} flexDirection="column" flexShrink={0}>
         <box onMouseUp={toggle}>
           <ReasoningHeader
-            toggleable={inMinimal()}
-            open={!inMinimal() || expanded()}
+            toggleable={true}
+            open={expanded()}
             done={isDone()}
             title={summary().title}
             duration={isDone() ? Locale.duration(duration()) : undefined}
           />
         </box>
-        <Show when={(!inMinimal() || expanded()) && summary().body}>
-          <box paddingLeft={inMinimal() ? 2 : 0} marginTop={1}>
+        <Show when={expanded() && summary().body}>
+          <box paddingLeft={2} marginTop={1}>
             <code
               filetype="markdown"
               drawUnstyledText={false}
@@ -1598,7 +1650,9 @@ function ReasoningHeader(props: {
     <Switch>
       <Match when={!props.done}>
         <box flexDirection="row">
-          <Spinner color={fg()}>{props.title ? "Thinking: " + props.title : "Thinking"}</Spinner>
+          <Spinner color={fg()}>
+            {`${props.toggleable ? (props.open ? "- " : "+ ") : ""}${props.title ? "Thinking: " + props.title : "Thinking"}`}
+          </Spinner>
         </box>
       </Match>
       <Match when={true}>
@@ -1652,11 +1706,9 @@ function ToolPart(props: { last: boolean; part: ToolPart; message: AssistantMess
   const ctx = use()
   const sync = useSync()
 
-  // Hide tool if showDetails is false and tool completed successfully
   const shouldHide = createMemo(() => {
-    if (ctx.showDetails()) return false
-    if (props.part.state.status !== "completed") return false
-    return true
+    if (props.part.tool === ShellID.ToolID) return !ctx.showCommands()
+    return !ctx.showDetails()
   })
 
   const toolprops = {
@@ -1819,6 +1871,8 @@ function InlineTool(props: {
       error()?.includes("specified a rule") ||
       error()?.includes("user dismissed"),
   )
+  const [expanded, setExpanded] = createSignal(false)
+  const foldable = createMemo(() => props.complete)
 
   return (
     <box
@@ -1828,6 +1882,7 @@ function InlineTool(props: {
       onMouseOut={() => setHover(false)}
       onMouseUp={() => {
         if (renderer.getSelection()?.getSelectedText()) return
+        if (foldable()) setExpanded((prev) => !prev)
         props.onClick?.()
       }}
       renderBefore={function () {
@@ -1855,11 +1910,17 @@ function InlineTool(props: {
     >
       <Switch>
         <Match when={props.spinner}>
-          <Spinner color={fg()} children={props.children} />
+          <Spinner color={fg()}>
+            {`${foldable() ? (expanded() ? "- " : "+ ") : ""}`}
+            {props.children}
+          </Spinner>
         </Match>
         <Match when={true}>
           <text paddingLeft={3} fg={fg()} attributes={denied() ? TextAttributes.STRIKETHROUGH : undefined}>
             <Show fallback={<>~ {props.pending}</>} when={props.complete}>
+              <Show when={foldable()}>
+                <span>{expanded() ? "- " : "+ "}</span>
+              </Show>
               <span style={{ fg: props.iconColor }}>{props.icon}</span> {props.children}
             </Show>
           </text>
@@ -1883,6 +1944,12 @@ function BlockTool(props: {
   const renderer = useRenderer()
   const [hover, setHover] = createSignal(false)
   const error = createMemo(() => (props.part?.state.status === "error" ? props.part.state.error : undefined))
+  const [expanded, setExpanded] = createSignal(false)
+  const foldable = createMemo(() => !!props.part)
+  const toggle = () => {
+    if (!foldable()) return
+    setExpanded((prev) => !prev)
+  }
   return (
     <box
       border={["left"]}
@@ -1898,6 +1965,7 @@ function BlockTool(props: {
       onMouseOut={() => setHover(false)}
       onMouseUp={() => {
         if (renderer.getSelection()?.getSelectedText()) return
+        toggle()
         props.onClick?.()
       }}
     >
@@ -1905,13 +1973,16 @@ function BlockTool(props: {
         when={props.spinner}
         fallback={
           <text paddingLeft={3} fg={theme.textMuted}>
+            <Show when={foldable()}>
+              <span>{expanded() ? "- " : "+ "}</span>
+            </Show>
             {props.title}
           </text>
         }
       >
-        <Spinner color={theme.textMuted}>{props.title.replace(/^# /, "")}</Spinner>
+        <Spinner color={theme.textMuted}>{`${foldable() ? (expanded() ? "- " : "+ ") : ""}${props.title.replace(/^# /, "")}`}</Spinner>
       </Show>
-      {props.children}
+      <Show when={expanded()}>{props.children}</Show>
       <Show when={error()}>
         <text fg={theme.error}>{error()}</text>
       </Show>
@@ -2070,10 +2141,40 @@ function Grep(props: ToolProps<typeof GrepTool>) {
 }
 
 function WebFetch(props: ToolProps<typeof WebFetchTool>) {
+  const { theme } = useTheme()
+  const ctx = use()
+  const output = createMemo(() => props.output?.trim() ?? "")
+  const [expanded, setExpanded] = createSignal(false)
+  const maxLines = 10
+  const maxChars = createMemo(() => maxLines * Math.max(20, ctx.width - 6))
+  const collapsed = createMemo(() => collapseToolOutput(output(), maxLines, maxChars()))
+  const limited = createMemo(() => {
+    if (expanded() || !collapsed().overflow) return output()
+    return collapsed().output
+  })
+
   return (
-    <InlineTool icon="%" pending="Fetching from the web..." complete={props.input.url} part={props.part}>
-      WebFetch {props.input.url}
-    </InlineTool>
+    <Show
+      when={output()}
+      fallback={
+        <InlineTool icon="%" pending="Fetching from the web..." complete={props.input.url} part={props.part}>
+          WebFetch {props.input.url}
+        </InlineTool>
+      }
+    >
+      <BlockTool
+        title={`# WebFetch ${props.input.url ?? ""}`}
+        part={props.part}
+        onClick={collapsed().overflow ? () => setExpanded((prev) => !prev) : undefined}
+      >
+        <box gap={1}>
+          <text fg={theme.text}>{limited()}</text>
+          <Show when={collapsed().overflow}>
+            <text fg={theme.textMuted}>{expanded() ? "Click to collapse" : "Click to expand"}</text>
+          </Show>
+        </box>
+      </BlockTool>
+    </Show>
   )
 }
 

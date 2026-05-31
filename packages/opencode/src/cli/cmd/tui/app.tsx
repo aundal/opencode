@@ -447,9 +447,63 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
     renderer.clearSelection()
   }
   const [terminalTitleEnabled, setTerminalTitleEnabled] = createSignal(kv.get("terminal_title_enabled", true))
+  const [terminalFocused, setTerminalFocused] = createSignal(true)
+  const [terminalUnread, setTerminalUnread] = createSignal(false)
   const [pasteSummaryEnabled, setPasteSummaryEnabled] = createSignal(
     kv.get("paste_summary_enabled", !sync.data.config.experimental?.disable_paste_summary),
   )
+  const terminalTitleOverride = createMemo(() => {
+    const value = kv.get("terminal_title_override")
+    return typeof value === "string" && value.trim() ? value.trim() : undefined
+  })
+
+  const terminalStatus = (sessionID: string) => {
+    const permissions = sync.data.permission[sessionID] ?? []
+    const questions = sync.data.question[sessionID] ?? []
+    if (permissions.length > 0 || questions.length > 0) return "working"
+    if (["busy", "retry"].includes(sync.data.session_status[sessionID]?.type ?? "idle")) return "working"
+    return "idle"
+  }
+
+  onMount(() => {
+    const focus = () => {
+      setTerminalFocused(true)
+      setTerminalUnread(false)
+    }
+    const blur = () => setTerminalFocused(false)
+    renderer.on("focus", focus)
+    renderer.on("blur", blur)
+    onCleanup(() => {
+      renderer.off("focus", focus)
+      renderer.off("blur", blur)
+    })
+  })
+
+  let previousTitleSessionID: string | undefined
+  let previousTitleStatus: "idle" | "working" | undefined
+  createEffect(() => {
+    if (route.data.type !== "session") {
+      previousTitleSessionID = undefined
+      previousTitleStatus = undefined
+      if (terminalUnread()) setTerminalUnread(false)
+      return
+    }
+
+    const status = terminalStatus(route.data.sessionID)
+    if (previousTitleSessionID !== route.data.sessionID) {
+      previousTitleSessionID = route.data.sessionID
+      previousTitleStatus = status
+      if (terminalUnread()) setTerminalUnread(false)
+      return
+    }
+
+    if (status === "working") {
+      if (terminalUnread()) setTerminalUnread(false)
+    } else if (previousTitleStatus === "working" && !terminalFocused()) {
+      setTerminalUnread(true)
+    }
+    previousTitleStatus = status
+  })
 
   // Update terminal window title based on current route and session
   createEffect(() => {
@@ -462,13 +516,11 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
 
     if (route.data.type === "session") {
       const session = sync.session.get(route.data.sessionID)
-      if (!session || SessionApi.isDefaultTitle(session.title)) {
-        renderer.setTerminalTitle("OpenCode")
-        return
-      }
-
-      const title = session.title.length > 40 ? session.title.slice(0, 37) + "..." : session.title
-      renderer.setTerminalTitle(`OC | ${title}`)
+      const title = terminalTitleOverride()?.trim()
+      const next = title || (!session || SessionApi.isDefaultTitle(session.title) ? "OpenCode" : session.title)
+      const truncated = next.length > 40 ? next.slice(0, 37) + "..." : next
+      const emoji = terminalStatus(route.data.sessionID) === "working" ? "💭" : terminalUnread() ? "🔔" : "✅"
+      renderer.setTerminalTitle(`${truncated} ${emoji}`)
       return
     }
 

@@ -14,6 +14,12 @@ export function datetime(input: number): string {
   return `${localTime} · ${localDate}`
 }
 
+export function timestamp(input: number): string {
+  const date = new Date(input)
+  const pad = (value: number) => value.toString().padStart(2, "0")
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+}
+
 export function todayTimeOrDateTime(input: number): string {
   const date = new Date(input)
   const now = new Date()

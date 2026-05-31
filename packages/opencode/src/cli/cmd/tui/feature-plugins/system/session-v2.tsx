@@ -394,30 +394,29 @@ function AssistantReasoning(props: {
   const thinking = useThinkingMode()
   const [expanded, setExpanded] = createSignal(false)
   const content = createMemo(() => props.part.text.replace("[REDACTED]", "").trim())
-  const inMinimal = createMemo(() => thinking.mode() === "hide")
+  const hidden = createMemo(() => thinking.mode() === "hidden")
   // v2 reasoning parts have no per-part `time.end` (see SessionMessageAssistantReasoning
   // in the v2 SDK); we settle on parent-message completion instead.
   const isDone = createMemo(() => props.completedAt() !== undefined)
   const summary = createMemo(() => reasoningSummary(content()))
 
   const toggle = () => {
-    if (!inMinimal()) return
     setExpanded((prev) => !prev)
   }
 
   return (
-    <Show when={content()}>
+    <Show when={!hidden() && content()}>
       <box paddingLeft={3} marginTop={1} flexDirection="column" flexShrink={0}>
         <box onMouseUp={toggle}>
           <ReasoningHeader
-            toggleable={inMinimal()}
-            open={!inMinimal() || expanded()}
+            toggleable={true}
+            open={expanded()}
             done={isDone()}
             title={summary().title}
           />
         </box>
-        <Show when={(!inMinimal() || expanded()) && summary().body}>
-          <box paddingLeft={inMinimal() ? 2 : 0} marginTop={1}>
+        <Show when={expanded() && summary().body}>
+          <box paddingLeft={2} marginTop={1}>
             <code
               filetype="markdown"
               drawUnstyledText={false}

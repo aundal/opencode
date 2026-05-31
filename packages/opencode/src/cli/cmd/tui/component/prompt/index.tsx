@@ -61,6 +61,8 @@ import { Flag } from "@opencode-ai/core/flag/flag"
 import { type WorkspaceStatus } from "../workspace-label"
 import { OPENCODE_BASE_MODE, useBindings, useCommandShortcut, useLeaderActive, useOpencodeKeymap } from "../../keymap"
 import { useTuiConfig } from "../../context/tui-config"
+import { DialogPrompt } from "../../ui/dialog-prompt"
+import { nextCommandMode, nextThinkingMode, useCommandMode, useThinkingMode } from "../../context/thinking"
 
 export type PromptProps = {
   sessionID?: string
@@ -147,6 +149,8 @@ export function Prompt(props: PromptProps) {
   const tuiConfig = useTuiConfig()
   const dialog = useDialog()
   const toast = useToast()
+  const commandMode = useCommandMode()
+  const thinkingMode = useThinkingMode()
   const status = createMemo(() => sync.data.session_status?.[props.sessionID ?? ""] ?? { type: "idle" })
   const history = usePromptHistory()
   const stash = usePromptStash()
@@ -198,6 +202,7 @@ export function Prompt(props: PromptProps) {
   const [workspaceCreatingDots, setWorkspaceCreatingDots] = createSignal(3)
   const [warpNotice, setWarpNotice] = createSignal<string>()
   const [cursorVersion, setCursorVersion] = createSignal(0)
+  let lastMouseDownAt = 0
   const currentProviderLabel = createMemo(() => local.model.parsed().provider)
   const hasRightContent = createMemo(() => Boolean(props.right))
 
@@ -350,6 +355,7 @@ export function Prompt(props: PromptProps) {
       cost: cost > 0 ? money.format(cost) : undefined,
     }
   })
+  const toolVisible = createMemo(() => kv.get("tool_details_visibility", true))
 
   const [store, setStore] = createStore<{
     prompt: PromptInfo
@@ -619,6 +625,64 @@ export function Prompt(props: PromptProps) {
               void warpSession(selection)
             },
           })
+        },
+      },
+      {
+        title: "Open commands",
+        desc: "Open the command palette",
+        name: "prompt.commands",
+        category: "Session",
+        slashName: "commands",
+        run: () => {
+          keymap.dispatchCommand("command.palette.show")
+        },
+      },
+      {
+        title: commandMode.mode() === "hidden" ? "Show shell commands" : "Hide shell commands",
+        desc: "Toggle raw command blocks in the session",
+        name: "prompt.command",
+        category: "Session",
+        run: () => {
+          commandMode.set(nextCommandMode(commandMode.mode()))
+          dialog.clear()
+        },
+      },
+      {
+        title: thinkingMode.mode() === "hidden" ? "Show thinking" : "Hide thinking",
+        desc: "Toggle thinking blocks in the session",
+        name: "prompt.thinking",
+        category: "Session",
+        run: () => {
+          thinkingMode.set(nextThinkingMode(thinkingMode.mode()))
+          dialog.clear()
+        },
+      },
+      {
+        title: toolVisible() ? "Hide tool rows" : "Show tool rows",
+        desc: "Toggle non-command tool rows in the session",
+        name: "prompt.tool",
+        category: "Session",
+        run: () => {
+          kv.set("tool_details_visibility", !toolVisible())
+          dialog.clear()
+        },
+      },
+      {
+        title: "Set terminal title",
+        desc: "Override the terminal title for this session",
+        name: "prompt.title",
+        category: "Session",
+        slashName: "title",
+        run: async () => {
+          const current = typeof kv.get("terminal_title_override") === "string" ? String(kv.get("terminal_title_override")) : ""
+          const value = await DialogPrompt.show(dialog, "Terminal title", {
+            value: current,
+            placeholder: "Enter title",
+          })
+          if (value === null) return
+          const next = value.trim()
+          kv.set("terminal_title_override", next || undefined)
+          dialog.clear()
         },
       },
     ].map((entry) => ({
@@ -1263,6 +1327,39 @@ export function Prompt(props: PromptProps) {
     )
   }
 
+  function expandTextPart(partIndex: number) {
+    const part = store.prompt.parts[partIndex]
+    if (part?.type !== "text" || !part.source?.text) return false
+
+    const virtualText = part.source.text.value
+    const offset = store.prompt.input.indexOf(virtualText)
+    if (offset === -1) return false
+
+    const nextInput =
+      store.prompt.input.slice(0, offset) + part.text + store.prompt.input.slice(offset + virtualText.length)
+    const nextParts = store.prompt.parts.filter((_, index) => index !== partIndex)
+
+    input.setText(nextInput)
+    setStore("prompt", {
+      input: nextInput,
+      parts: nextParts,
+    })
+    restoreExtmarksFromParts(nextParts)
+    input.cursorOffset = offset + part.text.length
+    setCursorVersion((value) => value + 1)
+    return true
+  }
+
+  function handlePromptDoubleClick() {
+    const offset = input.visualCursor.offset
+    const partIndex = store.prompt.parts.findIndex((part) => {
+      if (part.type !== "text" || !part.source?.text) return false
+      return offset >= part.source.text.start && offset <= part.source.text.end
+    })
+    if (partIndex === -1) return
+    expandTextPart(partIndex)
+  }
+
   async function pasteInputText(text: string) {
     const normalizedText = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n")
     const pastedContent = normalizedText.trim()
@@ -1558,7 +1655,12 @@ export function Prompt(props: PromptProps) {
                   input.cursorColor = theme.text
                 }, 0)
               }}
-              onMouseDown={(r: MouseEvent) => r.target?.focus()}
+              onMouseDown={(r: MouseEvent) => {
+                r.target?.focus()
+                const now = Date.now()
+                if (now - lastMouseDownAt < 300) handlePromptDoubleClick()
+                lastMouseDownAt = now
+              }}
               focusedBackgroundColor={theme.backgroundElement}
               cursorColor={props.disabled ? theme.backgroundElement : theme.text}
               syntaxStyle={syntax()}
@@ -1755,6 +1857,27 @@ export function Prompt(props: PromptProps) {
                   <text fg={editorContextLabelState() === "pending" ? theme.secondary : theme.textMuted}>{file()}</text>
                 )}
               </Show>
+              <box gap={1} flexDirection="row">
+                <text
+                  fg={theme.textMuted}
+                  onMouseUp={() => thinkingMode.set(nextThinkingMode(thinkingMode.mode()))}
+                  wrapMode="none"
+                >
+                  Think [{thinkingMode.mode() === "hidden" ? " " : "X"}]
+                </text>
+                <text fg={theme.textMuted}>|</text>
+                <text fg={theme.textMuted} onMouseUp={() => kv.set("tool_details_visibility", !toolVisible())} wrapMode="none">
+                  Tool [{toolVisible() ? "X" : " "}]
+                </text>
+                <text fg={theme.textMuted}>|</text>
+                <text
+                  fg={theme.textMuted}
+                  onMouseUp={() => commandMode.set(nextCommandMode(commandMode.mode()))}
+                  wrapMode="none"
+                >
+                  Cmd [{commandMode.mode() === "hidden" ? " " : "X"}]
+                </text>
+              </box>
               <Switch>
                 <Match when={store.mode === "normal"}>
                   <Switch>
